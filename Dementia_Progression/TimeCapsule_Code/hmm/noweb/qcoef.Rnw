@@ -1,0 +1,12 @@
+\section{Creating the qcoef matrix}
+The \code{qcoef} argument of the hmm function offers great flexibility,
+but it can also be a PITA to set up, particularly if the set of functions
+changes.
+This function uses formulas to speed up the process.  The function accepts 
+a set of named arguments each of which is either a list containing
+a formula and initial values, or is simply a formula, and produces a suitable
+data frame.
+
+
+
+

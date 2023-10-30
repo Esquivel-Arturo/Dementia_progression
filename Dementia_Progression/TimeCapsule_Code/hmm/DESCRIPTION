@@ -1,0 +1,22 @@
+Title: HMM models with population correction
+Description: Fit hidden Markov models to the Alzhiemer's data set.
+Package: hmm
+Version: 1.1-6
+Depends: survival, expm
+Imports: parallel, mvtnorm
+Suggests: msm
+Lazyload: Yes
+LazyData: Yes
+Authors@R: c(person(c("Terry", "M"), "Therneau", 
+                    email="therneau.terry@mayo.edu",
+	            role=c("aut"), comment="original version"),
+             person("Weigand", "Stephen", role=c("aut","cre"), 
+	     email = "weigand.stephen@mayo.edu"),
+	     person("Wiste", "Heather", role="ctb"))
+License: GPL
+NeedsCompilation: yes
+Packaged: 2017-07-24 19:20:57 UTC; therneau
+Author: Terry M Therneau [aut] (original version),
+  Weigand Stephen [aut, cre],
+  Wiste Heather [ctb]
+Maintainer: Weigand Stephen <weigand.stephen@mayo.edu>

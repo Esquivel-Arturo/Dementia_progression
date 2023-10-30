@@ -1,0 +1,15 @@
+useDynLib(hmm)
+import(survival, parallel)
+importFrom(expm, expm)
+importFrom(mvtnorm, rmvnorm, dmvnorm)
+importFrom(stats, model.extract, model.response, model.matrix, model.weights,
+           model.frame, na.pass, na.omit, terms, cov, sd, dnorm, rnorm, runif,
+           delete.response, coef, printCoefmat, naprint,
+           dlogis, plogis, pnorm)
+export(hbind, hmm, hmm_noerror, hmminit, hmmtest, hmmdetail, mlogit)
+export(hmulti, hmmscore)
+export(mcmc0, mcmc2, pade, derivtest, hmmscore)
+export(hmmlcut, hmmncut, hmmlcut, hmmesetup, hmmemat, hmulti)
+S3method(print, hmm)
+# S3method('plot',  'hmm')
+S3method(coef,  hmm)

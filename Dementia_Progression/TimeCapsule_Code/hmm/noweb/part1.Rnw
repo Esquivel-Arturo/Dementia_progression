@@ -1,0 +1,272 @@
+% This is a noweb document (not knitr or Sweave).
+\documentclass{article}
+\usepackage{noweb}
+\usepackage{amsmath}
+\title{The HMM fitter for cognition data}
+\author{Terry Therneau}
+
+\addtolength{\textwidth}{1in}
+\addtolength{\oddsidemargin}{-.5in}
+\setlength{\evensidemargin}{\oddsidemargin}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\erf}{\mbox{erf}}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\section{Introduction}
+This document contains code for a general fitter for
+hidden Markov models (HMM) as applied to the Alzheimer study data.
+Note that this is a noweb document (not knitr or Sweave),
+extract codes using notangle and use noweave to create the pdf.
+(See the Makefile).
+This first section has the basic math.  Skip it if you can.
+
+Notation.  This is the derivation for a single subject with observations
+$j$ = 1, 2, \ldots  (I will later use $i$ for subjects.)
+\begin{itemize}
+  \item $y$: the vector of observed values for subject.  This could
+  be a matrix if there are multiple response variables, but the 
+  notation below will ignore this.  
+  \item $s$: the vector of true states.  There are
+    $q$ true states.  
+  \item $\beta$: parmaeters of interest.
+  \item $\pi$: a distribution over the starting states
+\end{itemize} 
+
+The HMM probability is formally a very large sum over all possible paths:
+\begin{equation}
+  P(y | \beta, \pi) = \sum_{s_1, s_2, \ldots} P(y | s) P(s; \beta, \pi)
+  \label{full}
+\end{equation}
+The sum is over all possible paths through the states: if subject Jones
+had 7 observations with 6 possible states
+this would be a sum over $6^7 \approx 280,000$ terms.
+For each of those possible paths we have the probability of that path,
+given the coefficients of the model, times
+the probability of observing the vector of outcomes $y$ for that true path.
+
+A big simplification comes from two assumptions: first that $y_j$ depends
+only on the current true state $s_j$, 
+and the Markov property of the underlying
+chain, which means that the current state depends only 
+on the prior state.
+This allows the computation to be written as a nested sum:
+\begin{align}
+   P(y | \beta, \pi) &= \sum_{1_1} \left[P(y_{1}| s_1)P(s_1 | \pi, \beta) B_2 
+            \right] \nonumber \\
+    B_2  &= \sum_{s_2} \left[ P(y_{2}| s_2)P(s_2| s_1, \beta) B_3 \right] 
+            \nonumber\\
+    B_3  &= \sum_{x_3} \left[P(y_{3}| s_3)P(s_3| s_2, \beta) B_4 \right]
+            \nonumber \\
+    B_4  &=  \ldots     \label{recur}
+ \end{align}
+
+The references all now say ``thus calculating the probability reduces to
+matrix multiplication'', which was not at all obvious to me.  Let's work
+it out. 
+
+Let $P_{m}$ be the transition matrix from observation
+time $m-1$ to $m$ for the subject.  The $jk$ element of the matrix
+is the probability that the subject will be in true state $k$ at time
+$m$ given that they were in state $j$ at $m-1$.
+$P$ depends only on the underlying rates and observation times,
+and has the form $P = \exp(t R)$ where $R$ is the rate matrix and 
+$t$ is the length of the time interval.
+The matrix product $P_{1}P_{2}$ is the transition matrix from 0 to 2:
+the $jk$ element of the matrix product is a sum over all the states that might
+have been visited at time 1 (write it out). 
+This is a case where matrix multiplication happens to do exactly the right 
+thing.  (Maybe if I were a better mathematician it would be ``of course'' 
+instead of ``just happens''.)
+Likewise $P_{1}P_{2}P_{3}$ is the transition for 0 to 3, etc.,
+and $\pi P_{1}P_{2}P_{3}$ the probability vector for the states at time 3
+where $\pi$ is the initial probability distribution.
+
+Let $D_m$ be a diagonal matrix with $jj$ element 
+$Pr(y_{m} | s_m = j, \gamma)$, the probability of the observed $y$ at
+time $m$ for each possible true underlying state,
+possibly depending on some estimated parameters $\gamma$.
+The $jk$ element of $T_{m} = P_{m}D_{m}$ is the probability that the subject
+will be in true state $k$ \emph{and} observed status $y_{m}$ at time $m$
+given that they were in true state $j$ at time $m-1$.
+The matrix product $\alpha_{i} = \alpha_1 \prod_{k=2}^m P_mD_m$ is the vector
+containing for each true state the probability that the subject will
+will be in that state at observation $m$ and have the sequence $y_{1},
+y_{2}, \ldots y_{m}$ of observed states.
+It captures equation \eqref{recur} above.
+This is identical to Jackson's definition of $T$, section 1.6.3 of the 
+msm manual, and the recursion formula of Shokhirev; we'll
+talk about $\alpha_1$ below.
+
+Let $\exp(t_k R_k)$ be the transition matrix that applies to row $k$ of the
+data set, where exp is the matrix exponential,
+$t_k$ is the span of time represented by that row of data, and
+$R_k$ is the rate matrix for that row.
+Then the transition matrix $P$ for the time span is 
+\begin{equation}
+  P_k = \prod \exp(t_k R_k)  \label{trans} \\
+\end{equation}
+The product will be over multiple rows for the subject whenever we have
+covariate-change-only rows inserted.
+The fact that subjects have rows of data that only mark a covariate
+change but not an observation of $y$ is a nuisance wrt the coding but not
+a great one.
+The program lurches forward by groups of rows, up to the next ``real'' one.
+Our index $m$ above counts only the ones for which $y$ is observed.
+
+
+The general likelihood for subject $i$ is then of the form
+\begin{equation}
+  \alpha_i(t_j) = \pi_i (P_{i1}D(y_{i1}))(P_{i2}D(y_{i2}))\ldots (P_{ij}D(y_{ij}))
+  \label{basic}
+\end{equation}
+The $k$th element of $\alpha$ is the probability that the true state is
+$k$ given the observed data.
+There is a separate $\alpha$ computation for each subject $i$.
+The initial value $\pi_i$ is the distribution of the states for the 
+subject, and the
+subject is observed at times  %t_0$, $t_1$, $t_2$, etc. 
+
+Special case 1: if there is a state $d$ whose time is observed exactly,
+then we assume that at time $t-0$ the subject was in some other
+state, followed by an instantaneous transition to $d$.
+This scales column $k$ of the transition matrix $P(s,t)$ by
+$R_{kd}$, except column $d$ of course with is left as is.
+This is equivalent to multiplication by a diagonal marix;
+it replaces the usual $D$ -- any state whose time is observed
+exactly also has no labeling error.
+Very often $d$ is the death state.
+
+So far there is no difference between what we have done and the
+excellent msm code of Jackson.
+However, our data is a representative sample from the population.
+Instead of a fixed prior probability for each subject, normally the
+same for each subject, we work with a common $\pi_0$ at age 50.
+We then compute the population distribution at the subject's entry
+age as $pi_0 P(0, t)$ where $t$ is the entry age.   
+This is then renormed so that the sum of states is 1, excluding dementia
+and death, to give the $\pi_i$ vector from which subject $i$ was drawn.
+If $E$ is a diagonal matrix giving the chance of enrollment for each state,
+then the enrollment distribution is $\pi E / (\pi E 1')$.
+For us the state at enrollment is informative (it contains about 1/2 the
+statistical information in the sample), for most hmm data sets this is
+not the case.
+
+The other big difference is that we do the setup differently, which is
+different just because I wanted to try out another way.  
+A big nuisance of this problem is that the user has to specify so very
+many things, namely the valid states, which transitions are possible
+between states, which covariates apply to \emph{each} transition,
+which coefficients are common between selected transitions and covariates,
+and much more.  A single simple formula like lm() uses is not sufficient.
+
+
+\section{Data}
+The data setup for \code{msm} is different than that for survival
+functions, something that I was slow to catch on to.
+In msm we have a row of data for each observation time that contains both
+the predictors and outcomes measured at that time. 
+Covariates attached to the last observation time are not used, and in fact
+could often be missing if that last observation is death.
+In (start, stop] survival data the covariates apply to the interval and
+the event occurs at the end of the interval. 
+
+If someone was seen 5 times the msm data set will have 5 observations,
+and the covariates on row 5 are ignored.
+The survival data set would have 4 observations, but needs to add
+an istate variable to indicate the intial state.
+The first version of the hmm code used survival style data, simply because
+we have so many tools for such data.
+However, that approach only works when the outcome is a single categorical
+variable. 
+The current accepts either style.  If the response variable is a Surv
+object then it assumes survival style, otherwise ordinary data style.
+The hmmdata function converts msm style data to survival style.
+
+<<hmmdata>>=
+hmmdata <- function(formula, data, na.action=na.pass, id,
+                    istate="istate", tstart="tstart") {
+    # Start with standard model.frame stuff.  The right hand side of the
+    #  formula will nearly always be "."    
+    Call <- match.call()
+    indx <- match(c("formula", "data", "id"), 
+                  names(Call), nomatch=0)
+    if (indx[1] ==0) stop("a formula argument is required")
+    temp <- Call[c(1L, indx)]
+    temp$na.action <- na.pass
+    temp[[1L]] <- quote(stats::model.frame)
+    mf <- eval.parent(temp)
+    
+    Y <- model.response(mf)
+    if (!is.Surv(Y)) stop("left hand side of the formula must be a Surv call")
+    if (ncol(Y) ==3) stop("data set already has a start-stop format")
+    id <- model.extract(mf, "id")
+    if (is.null(id)) stop("id variable not found")
+    <<create-istate>>
+    <<create-data>>
+    }
+@ 
+
+Order the data by subject and survival time, then pick off the first
+state for each subject.
+<<create-istate>>=
+uid <- unique(id)  #unique id values, in the order in which they appear
+index <- order(match(id, uid), Y[,2])
+mf <- mf[index,]
+Y  <- Y[index,]
+id <- id[index]
+first <- match(uid, id)
+@ 
+
+The new data set will have the variables for survival, but not the
+Surv object itself.
+<<create-data>>=
+if (attr(Y, "type") == "mright") {
+    states <- attr(Y, "states")
+    status <- factor(Y[,2], 0:length(states), labels=c("censor", states))
+}
+else status <- Y[,2]
+
+last <- c(first[-1] -1, nrow(mf))
+newY <- data.frame(t1= Y[-last,1], t2 =Y[-first,1], 
+                   status = status[-first], 
+                   istate= status[match(id, id)][-first])
+temp <- formula[[2]]  # find the old names
+if (class(temp[[2]])=="call" && temp[[2]][[1]] == as.name("Surv"))
+    yname <- c(tstart, as.character(temp[[2]][[2]]), istate, 
+               as.character(temp[[2]][[3]]))
+else yname <- c(tstart, dimnames(Y)[[2]], istate)
+names(newY) <- yname
+
+toss <- c(1, which(names(mf) == "(id)"))
+newdata <- cbind(newY, mf[-last, -toss])  #new Y variables, then all the others
+row.names(newdata) <- NULL
+newdata
+@ 
+
+One other aspect of the Alzheimers data is the dominance of age. 
+It needs to be added as an explicit time-dependent covariate.  
+For this task the survSplit routine is ideal.
+For msm style data first create a dummy variable which is exactly 1
+and then use it as the 'status'; the added rows will show up with
+a status of 0.
+
+When there are multiple variables on the left hand side, we want to
+be able to preserve the levels of any factors or characters.  This
+function creates a numeric matrix with an extra levels attribute.
+
+<<hbind>>=
+hbind <- function(...) {
+    temp <- list(...)
+    tlevel <- lapply(temp, function(x) {
+                     if (!is.numeric(x)) levels(as.factor(x))
+                     else NULL })
+    new <- do.call("cbind", lapply(temp, function(x) {
+          if (is.numeric(x)) x  else as.numeric(as.factor(x))}))
+    attr(new, "levels") <- tlevel
+    class(new) <- "hbind"
+    new
+}
+@ 
+

@@ -1,0 +1,733 @@
+\section{Likelihood}
+The likelihood is built up one subject at a time.
+To reprise
+\begin{equation*}
+  \alpha_i(t_j) = \pi_i [P_{i1}D(y_{i1})]\,[P_{i2}D(y_{i2})]\ldots [P_{ij}D(y_{ij})]
+\end{equation*}
+
+There are 3 separate compuations: the inital probability $\pi$,
+the transition matrices $P$ and the diagonal matrices $D$.
+The latter have 3 cases:
+\begin{itemize}
+  \item for a censored observation $D$ is the identity
+  \item for an exactly observed observation $D$ is an nstate by nstate
+    matrix, D[i,j] = rmat[i,j] if j=endstate and i ne j, 0 otherwise.
+    This is the same as letting D = diagonal (rmat[,j]) followed by 
+    summing alpha into the final state.
+  \item for all others $D$ is $Pr(y | s)$ for each state $s$.
+\end{itemize}
+
+
+It will sometimes be the case that the initial distribution 
+depends only on fixed parameters.
+In that case it is faster to call it once and be done with it.
+Derivatives in this case are 0 by definition.
+
+<<hmm-compute>>=
+if (bcount[3] ==0) p0fixed <- pfun(nstate)
+else p0fixed <- NULL
+@ 
+
+Compute the likelihood for a paricular parameter vector.
+This is the heart of the code.  The routine is set up for 
+a single subject so that we can use the parallel library.
+The data values of X, otype, etc are not formal arguments, on purpose.
+I want to allow the optimizer as an outside program, and this way we
+don't need to pass them through.  
+This is a case where R's use of lexical scoping works to our advantage,
+but it also means that we can't separate the h1 and h2 functions below as
+a separate R file; they need to be defined within the body of the
+hmm function.
+
+The vector $\alpha$ has length nstate.
+At each step we replace it with either $\alpha P$ or $\alpha D$ where
+$P$ is a full matrix (transmission) and $D$ is diagonal (response or initial) 
+The first function hmm1 computes the likelihood for a given subject,
+but only that, while hmm2 will deal with derivatives.
+For compactness the response and initial state functions do not return a
+set of diagonal matrices $D$, but pack them into a matrix with one row
+per observation and one column per state.  
+The R multiplication \verb!alpha %*% diag(d)! is equivalent to 
+the simpler elementwise multiplication \verb!alpha * d!.
+
+The optim function will sometimes make a very bad guess, such that the
+matrix exponent function will fail. If that happens
+we will get an alpha vector of all zeros, or one with an NA in it.
+Return a failure code in that case rather than dying outright.  The
+hmmxxx routines need to deal with it.  This is true for both hmm1 and
+hmm2.
+We sometimes get a $P$ entry that is a tiny bit less than zero due to
+roundoff errors.  Set eps to a threshold for ignoring those, the error check
+is looking for serious underflow/overflow, e.g., probabilities of 5.
+<<hmm-compute>>=
+eps <- 1e-4
+hmm1 <- function(who, beta) {
+    rows <- which(id ==uid[who])  # the subjects of interest
+    eta <- X[rows,] %*% beta
+    # starting probability
+    if (is.null(p0fixed))
+        alpha <- pfun(nstate, eta[1,b3], gradient=FALSE)
+    else alpha <- p0fixed
+ 
+    # Now the response functions for this set
+    rneed <- (otype[rows]==1 | otype[rows]==3)
+    rlist <- vector("list", ny)
+    for (k in 1:ny) {
+        j <- b2map[[k]]  #columns of beta for this response
+        indx <- rneed & !is.na(yobs[rows, k])
+        yy <- yobs[rows[indx], k]
+        if (length(yy) >0) {
+            if (length(j)==0) rlist[[k]] <-rfun[[k]](yy, nstate, gradient=FALSE)
+            else rlist[[k]] <- rfun[[k]](yy, nstate, eta[indx, j, drop=FALSE], 
+                              gradient=FALSE)
+        }
+    }
+
+    # Compute the collection of matrix exponentials for the subject
+    # The upper routine sends back the array of results as a vector
+    #  along with the number of times there were tied eigenvalues
+    #  we'll send the ties back as an attribute
+    # We don't need the last row for each subject.
+    # The call to upper uses the Ward approx (nterm=0) rather than
+    #  the Higham09.  The former seems to better match my pade routine.
+    r2 <- length(rows)
+    if (length(rows) > 1) {
+        if (any(abs(eta[-r2,]) > .Machine$double.max.exp/2)) {
+            # such a bad estimate that it may blow up the matrix exp
+            if (debug >1) browser()
+            return("underflow")
+        }
+        myexp <- .Call("upper", nstate, eta[-r2,,drop=FALSE], 
+                       ytime[rows[-r2]], rindex, 1e-7, 0)
+        ucount <- c(length(rows)-1, myexp$ties)
+        Pmat <- array(myexp$P, dim=c(nstate, nstate, length(rows)-1))
+    }
+    if (debug >2 & any(Pmat < -eps)) {
+        cat ("stop1\n"); browser()}
+    if (any(Pmat > (1+eps) | Pmat < -eps)) return("underflow")
+    Pmat <- pmax(Pmat, 0)  # we sometimes get tiny negative numbers
+    
+    # Now walk through the visits one by one
+    offset <- 0   # watch out for underflow
+    nc <- integer(ny)  # the number of non-censored & non-missing so far
+    rmat <- matrix(0., nstate, nstate)
+
+    for (jj in seq_along(rows)) {
+        j <- rows[jj] # j is the index in the original data, jj in our subset
+        if (otype[j] == 2) {
+            # exact event time (death)
+            rmat[rindex] <- exp(eta[jj-1, b1]) #covariate just before this point
+            dtemp <- rmat[,death]
+            alpha <- alpha * dtemp
+             if (debug > 2) cat("A2: j=", j, "alpha=", alpha, "\n")
+        }
+        else if (otype[j] == 3) {
+            # entry to the study
+            temp <- sum(alpha*entry)
+            if (temp <= 0) 
+              return(paste("subject", uid[who],"enters in an impossible state"))
+            alpha <- alpha*entry /temp
+            if (debug > 2) cat("A3: j=", j, "alpha=", alpha, "\n")
+        }
+    
+        if (otype[j]==3 || otype[j]==1) {  # an outcome was observed
+            temp <- rep(1, nstate)
+            for (k in 1:ny) {
+                if (!is.na(yobs[j,k])) {
+                    nc[k] <- nc[k] +1
+                    alpha <- alpha* rlist[[k]][,nc[k]]
+                    temp <- temp * rlist[[k]][,nc[k]]
+                }
+            }
+            if (!all(is.finite(alpha)) || sum(alpha) <=0) {
+                if (debug > 1) browser()
+                return("underflow") 
+            }
+            if (debug>2) cat("B: j=", j, "alpha=", alpha, "\n")
+        }
+
+        if (jj< r2) {  # if not the last obs
+            # transition matrix
+            alpha <- alpha %*% Pmat[,,jj]  # transition to next time point
+            if (debug > 2) cat("C: j=", j, "alpha=", alpha, "\n")
+
+            if (!all(is.finite(alpha)) || sum(alpha) <=0) {
+                if (debug > 1) browser()
+                return("underflow")
+            }
+            if (mean(alpha) < exp(-20)) { # beware underflow
+                reset <- min(-20, log(mean(alpha)))
+                if (debug > 2) cat(" offset=", offset,"reset=", reset, "\n")
+                offset <- offset + reset
+                alpha <- alpha * exp(-reset)
+            }
+        }
+    }
+
+    loglik <- offset + log(sum(alpha))
+    attr(loglik, "counts") <- ucount
+    loglik
+}
+@ 
+
+The second function computes derivatives, and is more subtle.
+The derivatives of the vector alpha is kept as three parts: 
+\code{pi.d}, \code{R.d} and \code{P.d} are the columns associated with
+the initial state, response functions, and transition matrices, respectively.
+Each is kept as a matrix with nstate rows and one column per parameter.
+From the product rule
+\begin{align}
+  \frac{\partial \alpha A}{\partial \theta_k} &=
+     \frac{\partial \alpha}{\partial \theta_k} A + 
+     \alpha  \frac{\partial A}{\partial \theta_k} \label{mderiv}
+\end{align}
+for any matrix $A$.
+To prove this simply write out the matrix product as a sum of terms,
+apply the product rule for derivatives to each term, and reassemble the
+result.
+
+First consider the case of a response function, in which case the
+update matrix $A$ of equation \eqref{mderiv} is a diagonal matrix $D$.
+For compactness response functions do not return a
+set of diagonal matrices $D$, but pack them into a matrix with one row
+per observation and one column per state.  
+Likewise the derivatives are sent as a 3 way array of (observation,
+state, parameter), again representing diagonal matrices.
+Written out the update step replaces the vector $\alpha$ with
+$(\alpha_1d_1, \alpha_2 d_2, \ldots, \alpha_p d_p)$, where $d$ are the
+diagonal elements of $D$.
+The derivative of element 2 say with respect to parameter $k$ is
+$(\partial\alpha_2/ \partial \theta_k) d_2 + 
+\alpha_2 (\partial d_2/\partial \theta_k)$. 
+In our compact form the first term multiplies each row $i$ of the current
+R.d matrix matrix by $d_i$, and the second term multiplies each
+row $i$ of the derivative matrix for the response by 
+$\alpha_i$. 
+
+Since the parameters for pi.d, R.d and P.d are disjoint only the first term
+of equation \eqref{mderiv} applies when updating P.d with respect to a 
+response function; the partial of the response function wrt those parameters
+is zero.  Likewise for updating pi.d.  
+
+The response and initial functions return derivatives with respect to
+each linear predictor $\eta$; this needs to be expanded to a derivative
+for each parameter using the chain rule
+\begin{align}
+  \frac{\partial f}{\partial \beta_k} &= 
+  \sum_j \frac{\partial f}{\partial \eta_j} 
+        \frac{\partial eta_j}{\partial \beta_k} \nonumber \\
+    \frac{\partial eta_j}{\partial \beta_k} &= x_m I_{c_{jm}=k} \label{partial}
+\end{align}
+In the above equation $c$= \code{cmap} and $x$ is the row of covariates
+for the observation in question. 
+
+Notice that the above collapses into a matrix multiplication.
+If $d$ is the vector of derivatives with respect to $\eta$ then
+$dA$ is the vector of derivatives with respect to $\beta$.
+If one of the parameters is related to more than one linear predictor,
+i.e., a shared parameter, this is taken care of by the matrix 
+multiplication without any further ado.
+If there are $p$ linear predictors and $m$ parameters ($m \ge p$)
+we need to create a $p$ by $m$ matrix to do the expansion.
+The matrix depends on the covariate values $X$ for the subject,
+equation \eqref{partial} describes the $jk$ element of the matrix.
+Use the \code{cmap} matrix to create special functions to make
+this process fast.
+The formals() trick allows us to set the default value for an argument.
+<<hmm-compute>>=
+makeindex <- function(cmap, all=cmap) {
+    nonzero <- (cmap > 0)
+    parms <- sort(unique(all[all>0]))  # the parameter numbers for this group
+    p <- ncol(cmap)    # number of linear predictors
+    k <- match(cmap[nonzero], parms)  #parameter number
+    nparm <- length(parms)
+    rr <- row(cmap)[nonzero]  # which X to use
+    cc <- col(cmap)[nonzero]  #which eta this is
+    list(xindex= rr, tindex= cc + (k-1)*p, dim=c(p, nparm))
+    }
+
+Rtrans <- vector("list", ny)  #one element per response function
+if (bcount[2]) { #if there are response parameters
+    tfun <- function(dmat, x, map) {
+        tmat <- matrix(0., map$dim[1], map$dim[2])
+        tmat[map$tindex] <- x[map$xindex]
+        dmat %*% tmat
+    }
+    for (i in 1:ny) {
+        if (length(b2map[[i]]) >0 && any(cmap[, b2map[[i]]] > 0)) {
+            formals(tfun)[[3]] <- makeindex(cmap[,b2map[[i]], drop=FALSE],
+                                            cmap[,b2])
+            Rtrans[[i]] <- tfun
+        }
+    }
+}
+if (bcount[3]) { #if there are initial probability  parameters
+    pitrans <- function(dmat, x, map) {
+        tmat <- matrix(0., map$dim[1], map$dim[2])
+        tmat[map$tindex] <- x[map$xindex]
+        dmat %*% tmat
+    }
+    formals(pitrans)[[3]] <- makeindex(cmap[,b3, drop=FALSE])
+}
+if (debug > 1) browser()
+@ 
+
+Updating the derivatives for $P.d$ requires a bit more thought.
+It is simpler to keep this matrix as (parameter, nstate): a row for
+each parameter.  The first term of \eqref{mderiv} then becomes
+\verb!P.d %*% P! where $P$ is the update matrix.
+The derivative of $P$ is a array dmat of dimension (nstate, nstate,
+number of parameters).
+The second term of equation \eqref{mderiv} has a first row of 
+\verb!alpha %*% dmat[,,1]!, a second row of \verb!alpha %*% dmat[,,2]!,
+etc.
+We also need to deal with expansion, like the repsonse and initial functions
+the derivatives returned from the computation routine are with respect
+to the linear predictors.
+Our first step is to expand the (nstate, nstate, n.eta) matrix to 
+(nstate, nstate, n.parm); ordinary matrix multiplication works if we
+just pretend the first matrix has dimensions (nstate*nstate, n.eta).
+The order in which this is stored allows elementwise multiplication
+by sufficient copies of alpha, followed by summation in groups of
+nstate rows, to produce the transpose of the desired matrix.
+
+<<hmm-compute>>=
+cmap.b1 <- makeindex(cmap[,b1, drop=FALSE])
+Ptrans <- function(alpha, dmat, x, map=cmap.b1) {
+    tmat <- matrix(0., map$dim[1], map$dim[2])
+    tmat[map$tindex] <- x[map$xindex]
+    #treat dmat as though it were a matrix with first dim nstate*nstate
+    dim(dmat) <- c(nstate*nstate, map$dim[1])
+    dmat2 <- dmat %*% tmat  #transform
+    t(rowsum(dmat2 * rep(alpha, nstate*map$dim[2]), rep(1:nstate, each=nstate),
+             reorder=FALSE))
+}    
+@ 
+
+For exact states our matrix $D$ is not diagonal.  Let $d$ be the state that
+was just observed exactly.
+The $D_{id} = R_{id}$ for $i \ne d$ and the rest of the matrix is zero.
+At this point the code only allows for death as an exact state, which is
+of course terminal, so we can treat this in exactly the same way as a 
+response function which returned the $d$th row of $R$.
+First find out which columns of $\eta$ are associated with the death
+state. We know that the first columns of beta map via rindex.
+
+Then we combine two operations: First get the derivatives wrt eta,
+then transform them.  Since each element of $R$ is either $\exp(eta)$
+or zero, the derivatives are pretty easy.  It will be a matrix with
+nstate rows and bcount[1] columns.  For each column associated with
+a death state it has the appropriate element of rmat inserted.
+<<hmm-compute>>=
+if (!missing(death)) {  
+    dtemp <- col(qmatrix)[rindex]
+    deathcol  <- which(dtemp== death)  # list of linear predictors
+    deathtrans <- function(R, x, map=cmap.b1) {
+        rows <- which(qmatrix[,death] > 0)  #non-zero elements of column d
+        dmat <- matrix(0, nstate, map$dim[1])
+        for (i in 1:length(rows)) 
+            dmat[rows[i], deathcol[i]] <- R[rows[i], death]
+
+        tmat <- matrix(0., map$dim[1], map$dim[2])
+        tmat[map$tindex] <- x[map$xindex]
+        dmat %*% tmat
+    }
+}
+@ 
+
+The current routines for state space transition are given the set of
+derivatives of rmat with respect to each eta.  This may be folded into
+those routines in the future.
+<<hmm-compute>>=
+psetup <- function(rmat, rindex) {
+    n.eta <- length(rindex)
+    out <- array(0., c(nstate, nstate, n.eta))
+    temp <- matrix(0., nstate, nstate)
+    rr <- row(temp)[rindex]
+    for (i in 1:n.eta) {
+        temp2 <- temp
+        exp.eta <- rmat[rindex[i]]  # elements of rmat are exp(eta)
+        temp2[rindex[i]] <-  exp.eta
+        temp2[rr[i], rr[i]] <- -exp.eta
+        out[,,i] <- temp2
+        }
+    out
+}
+@ 
+
+The last part of derivatives is the entry state.  When this occurs the
+$\alpha$ vector is replaced by elements of 
+\begin{eqnarray*}
+  \alpha_i^* &= e_i \alpha_i/(\sum_j e_j \alpha_j) \\
+  \frac{\partial \alpha_i^*}{\partial \theta_k} &=
+     \frac{e_i}{\sum_j e_j \alpha_j} \left(
+      \frac{\partial \alpha_i}{\partial \theta_k} - 
+       \frac{\alpha_i}{ \sum_j e_j \alpha_j}
+         \sum_j e_j \frac{\partial \alpha_j}{\partial \theta_k} \right)
+ \end{eqnarray*}
+
+<<hmm-compute>>=
+hmm2 <- function(who, beta) {
+    rows <- which(id ==uid[who])  # the subjects of interest
+    eta <- X[rows,] %*% beta
+    P.d  <- matrix(0., parmcount[1], nstate)
+    R.d  <- matrix(0., nstate, parmcount[2])
+    pi.d <- matrix(0., nstate, parmcount[3])
+
+    # starting probability
+    if (is.null(p0fixed)) alpha <- pfun(nstate, eta[1,b3], gradient=TRUE)
+    else alpha <- p0fixed
+    if (bcount[3]) {
+        pi.d <- pitrans(attr(alpha, 'gradient'), X[rows[1],])
+        attr(alpha, 'gradient') <- NULL  # no longer needed
+    }
+    
+    # Execute the response functions, over the uncensored obs
+    rlist <- rgrad <- vector("list", ny)
+    rneed <- (otype[rows] ==1 | otype[rows]==3)  # non-censored rows
+    for (k in 1:ny) {
+        index <- rneed & !is.na(yobs[rows,k])
+        j <- b2map[[k]]  #linear predictors for this response
+        yy <- yobs[rows[index], k]
+        if (length(yy) > 0) {
+            temp <- rfun[[k]](yy, nstate, eta[index, j, drop=FALSE], 
+                                gradient= TRUE)
+            rlist[[k]] <- temp
+            rgrad[[k]] <- attr(temp, "gradient")
+        }
+    }
+
+    # Walk through the observations one by one
+    P.d  <- matrix(0., pcount[1], nstate)
+    offset <- 0  # watch out for underflow
+    ecount <- c(length(rows), 0)
+    nc <- integer(ny)    #number non-censored so far
+    r2 <- length(rows)
+    rmat <- matrix(0., nstate, nstate)
+
+    for (jj in seq_along(rows)) {
+        j <- rows[jj]
+        if (otype[j] == 2) {
+            # exact event time (death)
+            dtemp <- rmat[,death]  #rate at this point
+            dtemp[death] <- 0      # this line should be redundant
+            if (pcount[3]) pi.d <- pi.d * rep(dtemp, pcount[3])
+            if (pcount[2]) R.d  <- R.d  * rep(dtemp, pcount[2])
+            # Why the j-1 below?  A death density has to depend on covariates
+            #  measured prior to the death, not measured at the death
+            # dtemp above already has this lag, since rmat is from prior iter
+            if (pcount[1]) P.d  <- P.d *  rep(dtemp, each=pcount[1]) +
+                             t(alpha * deathtrans(rmat, X[j-1,]))
+            alpha <- alpha * dtemp
+            if (debug > 2) {
+                cat("\n death: alpha=", format(alpha), "\n")
+                if (pcount[3]) print(pi.d)
+                if (pcount[2]) print(R.d)
+                print(P.d)
+            }
+            if (debug > 2) cat("A2: j=", j, "alpha=", alpha, "\n")
+        }
+        else if (otype[j] == 3) {
+            # entry to the study
+            temp <- sum(alpha*entry)
+            if (temp <= 0) return(paste("subject", uid[who],
+                                      "enters in an impossible state"))
+            if (pcount[3]) pi.d <- (entry/temp)*( pi.d -
+                               alpha %*% (entry %*% pi.d)/temp )
+            if (pcount[2]) R.d <- (entry/temp)* (R.d - 
+                               alpha %*% (entry %*% R.d)/temp)
+            # remember that P.d is (nparm, nstate)
+            if (pcount[1]) P.d  <- (rep(entry, each=pcount[1])/temp) * (P.d -
+                               outer(c(P.d %*% entry), alpha) /temp)
+            alpha <- alpha*entry /temp
+            if (debug > 2) {
+                cat("\n entry: alpha=", format(alpha), "\n")
+                if (pcount[3]) print(pi.d)
+                if (pcount[2]) print(R.d)
+                print(P.d)
+            }
+            if (debug > 2) cat("A3: j=", j, "alpha=", alpha, "\n")
+        }
+
+        if (otype[j]==3 || otype[j]==1) {  # an outcome was observed
+            for (k in 1:ny) {
+                if (!is.na(yobs[j,k])) {
+                    nc[k] <- nc[k] +1
+                    temp <- rlist[[k]][,nc[k]]
+                    if (pcount[3]) pi.d <- pi.d * temp 
+                    if (pcount[1]) P.d  <- P.d * rep(temp, each=pcount[1])
+                    if (pcount[2]) R.d  <- R.d * temp
+                    if (!is.null(Rtrans[[k]])) { #if there are derivatives
+                        dtemp <- Rtrans[[k]](rgrad[[k]][,nc[k],], X[j,])
+                        R.d  <- R.d + alpha * dtemp
+                     } 
+                    alpha <- alpha * temp
+                    if (debug > 3) {
+                        cat("\n response: alpha=", format(alpha), "\n")
+                        if (pcount[3]) print(pi.d)
+                        if (pcount[2]) print(R.d)
+                        print(P.d)
+                    }
+                }
+            }
+            if (!all(is.finite(alpha)) || sum(alpha) <=0) {
+                if (debug>1) browser()
+                return("underflow")
+            }
+            if (debug > 2) cat("B: j=", j, "alpha=", alpha, "\n")
+        }
+        
+        if (jj < r2) { # not the last row
+            # state matrix transformation P
+            rmat[rindex] <- exp(eta[jj,b1])
+            if (!all(is.finite(rmat))) {
+                # a horrible beta can overflow
+                if (debug > 1) browser()
+                return("overflow")
+            }
+            
+            diag(rmat) <- diag(rmat) -rowSums(rmat)
+            tder <- psetup(rmat, rindex)
+            if (any(diff(sort(diag(rmat))) < 1e-6)) {
+                ptemp <- pade(rmat *ytime[j], tder*ytime[j])
+                ecount[2] <- ecount[2] +1
+            }
+            else ptemp <- derivative(rmat, ytime[j], tder)
+            if (any(ptemp$P < -eps | ptemp$P >1)) return("underflow")
+            if (pcount[3]) pi.d <- t(ptemp$P) %*% pi.d 
+            if (pcount[2]) R.d <-  t(ptemp$P) %*% R.d 
+            if (pcount[1]) 
+                P.d <-  P.d %*% ptemp$P + Ptrans(alpha, ptemp$dmat, X[j,])
+            alpha <- drop(alpha %*% ptemp$P)   # ditch the dimensions
+            if (debug > 2) {
+                cat("\n j=", j, "jj=", jj, "alpha=", format(alpha), "\n")
+                if (pcount[3]) print(pi.d)
+                if (pcount[2]) print(R.d)
+            }
+            if (debug > 1) cat("C: j=", j, "alpha=", alpha, "\n")
+
+            if (!all(is.finite(alpha)) || sum(alpha) <=0) {
+                if (debug > 1) browser()
+                return("underflow")
+            }
+            if (mean(alpha) < exp(-20)) {
+                offset <- offset -20
+                alpha <- alpha * exp(20)
+                pi.d <- pi.d * exp(20)
+                R.d  <- R.d  * exp(20)
+                P.d  <- P.d  * exp(20)
+            }
+        }
+    }
+    if (debug > 1) cat("alpha=", alpha, "\n")
+    list(alpha=alpha, deriv= rbind(P.d, t(R.d), t(pi.d)), ecount=ecount,
+         offset = offset)
+}
+@
+
+All of the loglik functions have ... arguments added, to allow for other
+functions with extra args, and then someone calls these and forgets to
+toss those extras.  In particular the mcmc ones make use of cmap.
+
+<<hmm-compute>>=
+uid <- unique(id)
+nid <- length(uid)
+rindex <- which(qmatrix >0)
+
+#Give this next variable a long name that won't be found in calling
+#  routines.  It is updated farther down the calling chain.
+hmm_count_of_calls <- c(0, 0)  #total calls to expm, number with tied eigens
+
+if (mc.cores > 1 && makefork)
+    hmm_cluster <- makeForkCluster(mc.cores) #start up parallel
+
+hmmloglik <- function(param, ...) {
+    beta[cmap>0] <- param[cmap]
+    if (mc.cores > 1) {
+        if (makefork)
+            mcfit <- parLapply(hmm_cluster, 1:nid, hmm1, beta=beta)
+        else mcfit <- mclapply(1:nid, hmm1, beta=beta, 
+                               mc.set.seed=FALSE, mc.cores=mc.cores)
+    }
+    else mcfit <- lapply(1:nid, hmm1, beta=beta)
+    
+    if (any(sapply(mcfit, is.character))) {
+        # failure
+        words <- sapply(mcfit, function(x) ifelse(is.character(x), x, ""))
+        if (any(words == "underflow")) {
+            if (debug > 1) browser()
+            # assume a bad guess from a maximizer, return a bad hit
+            return(-2 * abs(initial.loglik))
+        }
+        words <- words[words!=""]
+        stop(words[1])
+    }
+
+    total <- sum(unlist(mcfit))
+    if (!is.null(pmat)) total <- total - c(param %*% pmat %*% param)/2
+    count <- sapply(mcfit, function(x) attr(x, "counts"))
+    # this next line reaches back and changes the variable in parent of parent
+    #  (the parent called the maximizer, which calls this)
+    hmm_count_of_calls <<- hmm_count_of_calls + rowSums(count)
+    total
+}
+
+# hand back everything (debug)
+hmmdb <- function(param, ...) {
+    beta[cmap>0] <- param[cmap]
+    if (mc.cores > 1) {
+        if (makefork)
+            mcfit <- parLapply(hmm_cluster, 1:nid, hmm2, beta=beta)
+        else mcfit <- mclapply(1:nid, hmm2, beta=beta, 
+                               mc.set.seed=FALSE, mc.cores=mc.cores)
+    }
+    else mcfit <- lapply(1:nid, hmm2, beta=beta)
+
+    if (any(sapply(mcfit, is.character))) {
+        # failure
+        words <- sapply(mcfit, function(x) ifelse(is.character(x), x, ""))
+        if (any(words == "underflow")) {
+            # assume a bad guess from a maximizer, return a bad hit
+            return(-2 * abs(initial.loglik))
+        }
+        words <- words[words!=""]
+        stop(words[1])
+    }
+
+    ecount <- sapply(mcfit, function(x) x$ecount)
+    hmm_count_of_calls <<- hmm_count_of_calls + rowSums(ecount)
+    dd <- dim(mcfit[[1]]$deriv)
+    alpha <- sapply(mcfit, function(x) x$alpha)
+    list(alpha = alpha,
+         offset = sapply(mcfit, function(x) x$offset),
+         loglik = sum(log(colSums(alpha))),
+         deriv = array(unlist(lapply(mcfit, function(x) x$deriv)),
+                       dim=c(dd, length(mcfit))),
+         ecount=ecount, offset= sapply(mcfit, function(x) x$offset))
+}
+@ 
+
+For each subject $\log(\sum \alpha) - offset$ is the log-likelihood
+value.  The nparameter by nstate derivative matrix \code{deriv}= $D$
+contains the first derivative of alpha for the subject, the row sums
+sums $u_i = D1/ (\sum \alpha)$ will be the derivative vector for each
+subject with respect to the loglik. 
+Fisher scoring uses the inverse of $S = \sum_i u_i u_i'$ as an estimate of the
+variance matrix of the parameters.
+This estimate is used successfully in glm models. 
+
+
+<<hmm-compute>>=
+hmmboth <- function(param, ...) {
+    beta[cmap>0] <- param[cmap]
+    if (mc.cores > 1) {
+        if (makefork)
+            mcfit <- parLapply(hmm_cluster, 1:nid, hmm2, beta=beta)
+        else mcfit <- mclapply(1:nid, hmm2, beta=beta, 
+                               mc.set.seed=FALSE, mc.cores=mc.cores)
+    }
+    else mcfit <- lapply(1:nid, hmm2, beta=beta)
+    
+    if (any(sapply(mcfit, is.character))) {
+        # failure
+        words <- sapply(mcfit, function(x) ifelse(is.character(x), x, ""))
+        if (any(words == "underflow")) {
+            # assume a bad guess from a maximizer, return a bad hit
+            return(list(loglik = -2 * abs(initial.loglik), deriv=NULL, S=NULL))
+        }
+        words <- words[words!=""]
+        stop(words[1])
+    }
+
+    ecount <- rowSums(sapply(mcfit, function(x) x$ecount))
+    hmm_count_of_calls <<- hmm_count_of_calls + ecount
+    
+    alpha <- sapply(mcfit, function(x) sum(x$alpha))
+    offset <- sapply(mcfit, function(x) x$offset)
+    d.alpha <- sapply(mcfit, function(x) rowSums(x$deriv))
+    u <- d.alpha * rep(1/alpha, each=nparm)
+    # this will be a matrix with nparm rows, one col per subject
+    deriv <- rowSums(u)
+    S = u %*% t(u)
+    u2 <- u - rowMeans(u)
+    S2 <- u2 %*% t(u2)
+    
+    if (is.null(pmat)) loglik <- sum(log(alpha) + offset)
+    else {
+        loglik <- sum(log(alpha)+offset) - c(param %*% pmat %*% param)/2
+        deriv  <- deriv - c(param %*% pmat)
+        S <- S + pmat
+        S2 <- S2 + pmat
+        }
+    list(loglik = loglik, deriv= deriv, S=S, S2=S2)
+    }
+
+hmmgrad <- function(param, ...) {
+    beta[cmap>0] <- param[cmap]
+    if (mc.cores > 1) {
+        if (makefork)
+            mcfit <- parLapply(hmm_cluster, 1:nid, hmm2, beta=beta)
+        else mcfit <- mclapply(1:nid, hmm2, beta=beta, 
+                               mc.set.seed=FALSE, mc.cores=mc.cores)
+    }
+    else mcfit <- lapply(1:nid, hmm2, beta=beta)
+    
+    if (any(sapply(mcfit, is.character))) {
+        # failure
+        words <- sapply(mcfit, function(x) ifelse(is.character(x), x, ""))
+        if (any(words == "underflow")) {
+            # assume a bad guess from a maximizer, return a bad hit
+            return(-2 * abs(initial.loglik))
+        }
+        words <- words[words!=""]
+        stop(words[1])
+    }
+
+    ecount <- rowSums(sapply(mcfit, function(x) x$ecount))
+    hmm_count_of_calls <<- hmm_count_of_calls + ecount
+    
+    alpha <- sapply(mcfit, function(x) sum(x$alpha))
+    d.alpha <- sapply(mcfit, function(x) rowSums(x$deriv))
+    # this will be a matrix with npar rows, one col per subject
+    u <- d.alpha * rep(1/alpha, each=nparm)
+
+    if (is.null(pmat)) rowSums(u)
+    else rowSums(u) - c(param %*% pmat)
+    }
+@ 
+
+
+
+The maximizer is an external function which gets called with a
+simple set of arguments: the initial parameters, the function to
+call, any arguments as supplied by the user, and the optional
+constraint matrix.
+If not present in the mpar list the par and fn arguments are filled
+in.  (But don't override an existing name).
+
+<<hmm-compute>>=
+# Get an initial loglik
+# If the maximizer fails (NA or infinite) it returns the initial;
+#  set it to a dummy value to detect that
+initial.loglik <- numeric(0)
+initial.loglik <- hmmloglik(param)
+if (length(initial.loglik)==0)
+    stop("unable to evalutate the likelihood at the intial parameters")
+
+mpar$par <- param   # the initial parameters
+if (is.null(mpar$fn)) mpar$fn  <- hmmloglik
+else mpar$fn <- get(mpar$fn)
+if (!is.null(mpar$gr) && is.character(mpar$gr)) mpar$gr <- get(mpar$gr)
+if (!is.null(constraint) && is.null(mpar["constraint"]))
+    mpar$constraint <- constraint
+
+#if (is.null(mpar$cmap)) mpar$cmap <- cmap
+
+time1 <- proc.time()
+fit <- do.call(mfun, mpar)
+if (mc.cores > 1 & makefork) stopCluster(hmm_cluster)
+time2 <- proc.time() 
+@ 
+
+
+

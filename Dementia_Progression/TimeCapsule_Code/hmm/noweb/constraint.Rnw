@@ -1,0 +1,51 @@
+\section{Constraints}
+We want to add a set of constraints $C\beta > 0$ where $C$ is a fixed
+matrix of $p$ columns. 
+The two natural constraints that come to mind are that the age coefficient
+should be $>0$.  A second is that ``A+ can't help'', i.e., the progression
+rate to N+ for A+ subjects is $\ge$ that for A- subjects, and ditto for
+most all pairs of conditions. 
+Since most of our rates are linear this needs to be modified slightly:
+one line is uniformly higher than another only if they are parallel.
+Instead make the constraint hold a some given age.  
+The target age for any constraint pair should probably be where the meat of
+said transitions are happening.  
+
+With respect to implementation there are several approaches.  The simplest
+is to add it to the HMM fits: any trial value that fails a constraint is
+not taken.  The constraints are essentially a prior.
+For scoring iteration we have 4 possibilities
+\begin{enumerate}
+  \item Soft threshold, by adding a $\sum k \exp(-C\beta)$ as a penalty.
+    The hard part is choosing $k$, and of course the penalties will not
+    be exact, but this is easy.  
+  \item The barrier method: $\sum k \log(C\beta)$.  As $k$ goes to zero this
+    becomes a hard threshold.  However, as pointed out others the barrier
+    problem can create a sharp narrow rigde in the likelihood which leads to
+    poor convergence.
+  \item A more sophisticated approach is to keep track of the active 
+    constraints.  Since all our constraints are linear we can easily
+    transform the problem to do directional maximization.  This is a 
+    sophisticated approach with lots of theory.
+  \item Transform to a new basis such that each constraint corresponds to a
+    single parameter, and then do unconstrained maximization on the exp scale.
+ \end{enumerate}
+
+Let us expand on 3 and 4.
+Start with a full rank matrix $D$ of which the constraint matrix $C$ forms 
+the first columns and let $\gamma$ = D\beta.  
+Then the first and second derivatives of the log-likelihood $L$ with respect
+to $\gamma$ are 
+\begin{align*}
+  \frac{\partial L}{\partial \gamma} &= D\frac{\parial L}{\partial \beta} \\
+  \frac{\partial^2 L}{\partial^2 \gamma} &= 
+      D\frac{\parial^2 L}{\partial^2 \beta} D'\\
+\end{align*}
+The active constraint method sets selected elements of $\gamma$ to zero
+and solves for the remainder.  
+The direct method replaces all of the parameters in question by 
+$\gamma_k = \exp(tau_k)$ and does unconstrained optimization.
+It is possible that the likelihood surface becomes difficult for this
+methods as well since certain coefficients will go to $\infty$.
+
+

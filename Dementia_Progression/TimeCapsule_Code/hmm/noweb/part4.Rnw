@@ -1,0 +1,57 @@
+<<hmm-finish>>=
+bcol <- paste0(row(qmatrix)[qmatrix!=0], ":",
+               col(qmatrix)[qmatrix!=0])
+if (bcount[2]>0) {
+    temp <- unique(rcoef[, c("response", "lp")])
+    lp <- temp$lp + 1 - temp$lp[match(temp$response, temp$response)]
+    bcol <- c(bcol, paste0("R", paste(temp$response, lp, sep='.')))
+}
+if (bcount[3]>0) bcol <- c(bcol, paste0("p", 1:bcount[3]))
+dimnames(beta) <- list(dimnames(X)[[2]], bcol)
+dimnames(cmap) <- dimnames(beta)
+
+nfit <- names(fit)
+indx <- pmatch(c("coef", "par", "log", "value"), nfit, nomatch=0)
+
+# find the fitted coefs in the output, and the loglik
+fcoef <- if (indx[1] >0) fit[[indx[1]]] else
+             if (indx[2]>0) fit[[indx[2]]] else {
+                 zz <- seq_along(nfit)[-indx]
+                 fit[[zz[1]]]
+             }
+
+if (is.matrix(fcoef)) {
+    if (ncol(fcoef) == nparm) {
+        beta[cmap>0] <- fcoef[nrow(fcoef), cmap]
+    } else stop("wrong number of columns in coefficient matrix")
+}
+else beta[cmap>0] <- fcoef[cmap]
+
+flog <-  if (indx[3] >0) fit[[indx[3]]] else
+             if (indx[4]>0) fit[[indx[4]]] else NULL
+
+time3 <- proc.time()
+compute.time <- rbind(setup= time1-time0,
+                      compute= time2- time1,
+                      finish = time3 - time2)
+
+final <- list(coefficients= fcoef, 
+              loglik = flog,
+              beta=beta,
+              fit=fit, 
+              loglik0 = initial.loglik,
+              evals= hmm_count_of_calls, 
+              time = compute.time,
+              scale =  scale,
+              bcount = bcount,
+              cmap=cmap, rmap=rindex,
+              qmatrix = qmatrix,   # the structure and state names
+              rfun= rfun, pfun=pfun,
+              nstate = nstate,
+              n = nrow(mf),
+              na.action = na.action,
+              call=Call)
+class(final) <- "hmm"
+if (debug) browser()
+final
+@ 

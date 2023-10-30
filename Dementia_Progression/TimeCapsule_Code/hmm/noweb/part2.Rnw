@@ -1,0 +1,612 @@
+\section{HMM function}
+\subsection{Setup}
+We have to inform the program of a long list of items in order for fitting
+to proceed.  For an HMM these include
+\begin{itemize}
+  \item The time interval data, covariates, and subject identifiers.
+  \item The set of true states and their connections (boxes and arrows).
+  \item Which covariates apply to which states, and possible initial values
+    for them.
+  \item The mapping function from observed states to true states.
+  \item Starting estimates for the parameters.
+  \item Technical information such as the number of cores or debugging state.
+\end{itemize}
+
+Here is the primary call.
+<<hmm>>=
+hmm <- function(formula, data, subset, weights, na.action= na.pass, 
+                id, istate, otype, qmatrix, qcoef, rfun, rcoef, 
+                pfun= hmminit, pcoef, entry, death,
+                mfun=hmmtest, mpar= list(), 
+                mc.cores= getOption("mc.cores", 2L),
+                icoef, scale=c(TRUE, FALSE), penalty, constraint,
+                debug=0, makefork=FALSE) {
+    Call <- match.call()
+    time0 <- proc.time()
+    <<hmm-getdata>>
+    <<hmm-check-args>>
+    <<hmm-setup>>
+    <<hmm-compute>>
+    <<hmm-finish>>
+}
+
+<<hbind>>
+@     
+
+The program is designed with a single model statement, as opposed to the msm
+package.  Various parts of the code then pick terms off of it.
+
+<<hmm-getdata>>=
+indx <- match(c("formula", "data", "subset", "weights",
+                "id", "istate", "otype"), names(Call), nomatch=0)
+if (indx[1] ==0) stop("a formula argument is required")
+if (indx[5] ==0) stop("an id argument is required")
+temp <- Call[c(1, indx)]
+temp[[1]] <- as.name("model.frame")
+temp$na.action <- na.pass   #deal with NA later
+mf <- eval(temp, parent.frame())
+
+if (nrow(mf) ==0) stop("data has 0 rows")
+Terms <- terms(mf)
+attr(Terms, "intercept") <- 1  # ignore any "-1" in formula
+termnames <- c("(Intercept)", attr(Terms, 'term.labels'))
+
+id <- model.extract(mf, "id")
+if (length(id)==0) stop("an id variable is required")
+otype <- model.extract(mf, "otype")
+if (is.null(otype)) otype <- rep(1L, nrow(mf))
+if (any(otype==2) & missing(death))
+    stop("death argument is missing and the data has deaths")
+first <- which(!duplicated(id))
+
+# missing values are done in a standard way if Y is a survival object
+# the do.call() construct allows na.action to be a function or a string
+if (missing(na.action)) na.action <- options("na.action")
+Y <- model.response(mf)
+X <- model.matrix(Terms, mf)
+xassign <- attr(X, "assign")
+@ 
+
+For the usual setup each row of data corresponds to a patient visit.
+The covariates for each row are used in predicting the response 
+function for that row and the transition probabilities for the next
+row.  Rows that are censored don't need a response probability since
+there was no response observed then.
+We also don't need a covariates for an exactly observed event since
+the error probability is zero.  
+An upshot of this is that if the last visit is exact, or if the response
+function uses only the intercept, then we don't need $X$ for that row
+and we can remove that row from the missing value logic.
+
+<<hmm-getdata>>=
+if (inherits(Y, "Surv")) {
+    stop("the survival portion off hmm is not longer supported")
+    temp <- do.call(na.action, cbind(Y, X))
+    if (nrow(temp) != nrow(Y)) { # some were tossed
+        na.action <- attr(temp, "na.action")
+        Y <- Y[-temp, ,drop=FALSE]
+        X <- X[-temp, ,drop=FALSE]
+        id <- id[-temp]
+    }
+    else na.action <- NULL
+    if (attr(Y, "type") != "mcounting")
+        stop("survival must be a multi-state counting process")
+    ylevels <- (attributes(Y))$states
+    
+    yobs  <- Y[,3, drop=FALSE]
+    otype <- otype * pmax(yobs, 1)
+    itime <- Y[first,1]     # do I ever use this?
+    ytime <- Y[,2] - Y[,1]  # length of each interval
+    censor <- (yobs==0)
+    ny <- 1
+    
+    istate <- model.extract(mf, "istate")
+    if (missing(istate)) 
+        stop("for a survival type endpoint, istate is required")
+    else istate <- matrix(istate)
+}
+else {
+    # the data set will have a row for each visit. 
+    if (!is.matrix(Y) || ncol(Y) < 2) 
+        stop("response must have at least two columns")
+    ny <- ncol(Y) -1
+    if (ny != length(rfun))
+        stop("the number of mapping functions must be equal to the number of responses")
+    last  <- !duplicated(id, fromLast=TRUE)
+                                  
+    if (is.character(Y)) {   # the caller used cbind(), fix this first
+        ymiss <- is.na(Y)
+        ylevels <- lapply(2:ncol(Y), function (i) {
+            temp <- suppressWarnings(as.numeric(Y[,i]))
+            if (any(is.na(temp) & !ymiss[,i])) 
+                levels(as.factor(Y[,i])) else NULL
+            })
+        tempy <- Y
+        Y <- matrix(0, nrow(Y), ncol(Y))
+        Y[,1] <- suppressWarnings(as.numeric(tempy[,1]))
+        for (i in 2:ncol(Y)) {
+            if (is.null(ylevels[[i-1]])) 
+                Y[,i] <- suppressWarnings(as.numeric(tempy[,i]))
+            else Y[,i] <- as.numeric(as.factor(tempy[,i]))
+        }
+    }
+    else ylevels <- attr(Y, "ylevels") # if they used hbind
+                                  
+    not.needed <- (last & otype %in% c(0, 2))
+    X[not.needed,] <- 0   #turn any missings into zeros, and keep the row
+    
+    toss <- which(is.na(Y[,1]) | apply(is.na(X), 1, any))
+    if (any(toss)) {
+        na.action <- toss
+        class(na.action) <- "omit"
+        Y <- Y[-toss,, drop=FALSE]
+        X    <- X[-toss,, drop=FALSE]
+        id   <- id[-toss]
+        otype <- otype[-toss]
+        first <- which(!duplicated(id))
+        last <- !duplicated(id, fromLast=TRUE)
+    }
+    else na.action <- NULL
+    ytime <- c(diff(Y[,1]), 0)  # time to next obs, ignored for last
+    yobs  <- Y[,-1, drop=FALSE] # the observed Y values
+}
+ymiss <- is.na(yobs)  #some individual elements may be missing
+weights <- model.weights(mf)
+if (length(weights) >0) stop("weights are not supported")
+@     
+
+The \code{otype} variable identifies the type of each row of the data as
+0=censored, 1= ordinary, 2= exact, 3= entry 
+If $y$ is a multi-state survival object then the \code{hmm} routine makes an
+assumption that censoring corresponds to the censoring indicator 
+(obviously), and the otype variable only needs to contain the exact indicator.
+If $y$ is a matrix the first column is assumed to be time and the remaining
+ones are outcomes.  It is a restriction in R that the result of cbind must
+be all of one type: factors will be turned in to numeric.
+The extracted data is put into three objects: \code{yobs}, \code{ytime}, 
+and ylevels.  The last exists only if the $y$ is a factor or a survival
+object.
+
+The iteration is more stable if we standardize the X matrix
+We want to spare the users from this detail, so coefficients are
+transformed back and forth: only the optimizer sees the transformed
+ones.  Settle for simple standardization by mean and std.
+Death rows for a subject often have lots of NA values, which were turned into
+zero just above, so leave them out.  Censored last rows for a person are
+also subject to fill in and are left out as well.
+For numerical accuracy we need to approximately center the data, but getting 
+the mean ``exactly so'' isn't necessary.  It suffices to avoid the artifical
+zeros.  Don't recenter columns that are a constant, i.e., the intercept.
+
+<<hmm-getdata>>=
+# standardize the X matrix
+xmean  <- rep(0.0, ncol(X))
+xscale <- rep(1.0, ncol(X))
+keep <- which(!(otype==2 | (last & otype==0)))
+if (is.logical(scale)) {
+    if (length(scale)==1) scale <- c(scale, scale)
+    if (scale[1]) { # recenter the data
+        xmean <- colMeans(X[keep,,drop=FALSE])
+        for (i in 1:ncol(X)) if (all(X[keep,i] == X[keep[1],i])) xmean[i] <- 0
+        }
+    if (scale[2]) {
+        xscale <- apply(X[keep,,drop=FALSE], 2, sd)
+        xscale <- ifelse(xscale < 1e-8, 1, xscale)  #avoid division by 0
+        }
+    scale <- list(center=xmean, scale=xscale)
+}
+else if (is.list(scale)) {
+    if (length(scale)!=2 || !all(sapply(scale, is.numeric)))
+        stop("scale must be logical, or a list containing the center and scale")
+    if (any(sapply(scale, length) != ncol(X)))
+        stop("wrong length for numeric components of scale")
+    xmean <- scale[[1]]
+    xscale <- scale[[2]]
+    }
+                   
+if (any(xmean!=0 | xscale !=1))
+    X <- scale(X, center=xmean, scale=xscale)
+@ 
+
+Check the survival times: subjects must be sorted by survival
+within id, and the survival times must be contiguous.
+The data does not need to be sorted by id.
+
+<<hmm-check-args>>=
+temp <- diff(match(id, id))
+if (any(temp < 0)) {
+    indx <- 1 + min(which(temp<0))
+    stop("all the rows for each subject must be contiguous in the data set",
+         paste("(row", indx, ")"))
+}
+
+if (any(ytime[!last] <=0)) {
+    temp <- seq(along=ytime)[!last]
+    indx <- min(temp[ytime[!last] <=0])
+    stop("the rows for each subject must be in time order, with no duplicate times", paste("(row", indx, ")"))
+}
+@ 
+
+Model setup is the most tedious part of the code. 
+In the  hmm model there are multiple linear predictors: one for each
+non-zero transition between states, others for each mapping function
+between the observed y and the true states, and optionally predictors
+for the distribution of initial states.  
+Some of the coefficients associated with these LP will be fixed and
+some will be maximized, and some will be shared between multiple terms.
+At the end we want to have a set of matrices.
+\begin{itemize}
+  \item X is the standard matrix from our formula, one row per subject
+    with p columns.
+  \item beta is a matrix with p rows and one column per linear predictor,
+    at the start it gets filled in with initial and fixed values.
+  \item cmap is an integer matrix of the same dimension as beta, containing
+    0 for coefficients that are not maximized, and the parameter number
+    for those that are maximized.  When two LP share coefficients, e.g. assume
+    that two rates are identical, then the same parameter id will appear in multiple
+    columns of cmap.  The maximum value of cmap is the number of optimized
+    parameters \code{npar}.
+  \item the vectors qbeta, mbeta, pbeta give the column numbers of beta that
+    are devoted to the rate matrix $Q$, the mapping functions, and to the 
+    estimate of $\pi_0$.  If there are multiple responses then pbeta has
+    a map for each.
+\end{itemize}
+
+The user level input for each of these is a data frame: qcoef, rcoef, and
+pcoef.  Each of these has identifying columns along with the term
+to which they refer, a coeffient number, and optional starting value(s).
+They are dealt with further below.
+
+Setup has 3 portions.  First deal with the $Q$ matrix, which defines state,
+then the coef matrices, then final notes
+values.
+<<hmm-setup>>=
+<<hmm-qmat>>
+<<hmm-coef>>
+<<hmm-setup-other>>
+@ 
+
+Start with the matrix $Q$ which describes the possible transitions between
+states. 
+This is necessary to carry information on the valid set of states, if nothing 
+else, since the response $y$ can be something entirely different.
+Verify that the qmatrix terms are
+consistent, and build the map between coefficients and the $X$
+matrix.
+Start by checking the consistency of \code{qmat}, and then
+create the index into qmatrix that numbers the legal
+transitions as 1, 2, \ldots.  
+This index ends up sorted by ending state.
+
+
+<<hmm-qmat>>=
+if (missing(qmatrix)) stop("the qmatrix argument is required")
+if (!is.matrix(qmatrix) || (nrow(qmatrix) != ncol(qmatrix))) 
+    stop("qmatrix must be a square matrix")
+nstate <- nrow(qmatrix)
+temp <- dimnames(qmatrix)
+if (length(temp[[1]]) > 0) {
+    statenames <- temp[[1]]
+    if (length(temp[[2]]) > 0 && temp[[2]] != temp[[1]])
+        stop("row and column names for qmatrix must be identical, if present")
+}
+else if (length(temp[[2]]) >0) statenames <- temp[[2]]
+else statenames <- 1:nstate
+
+diag(qmatrix) <- 0
+if (any(qmatrix < 0)) stop("qmatrix elements must be >=0")
+qmap <- which(qmatrix != 0)   
+ntransitions <- length(qmap)
+if (all(qmatrix[row(qmatrix) > col(qmatrix)] == 0)) uppertri <- TRUE
+else {
+    uppertri <- FALSE
+    # the line below will eventually go away
+    stop("transition matrix must be upper triangular")
+    }
+@ 
+
+
+The initial rates for the intercepts are normally
+provided by the user as elements of \code{qmatrix}
+and are assumed to be parameters of the fit.
+As a courtesy, the qcoef object is supplimented with this
+information.
+
+<<hmm-qmat>>=
+qcoef2 <- data.frame(state1 = row(qmatrix)[qmatrix>0],
+                     state2 = col(qmatrix)[qmatrix>0],
+                     term   = 0,    #intercept
+                     coef  = 1:ntransitions + 100,
+                     init   = log(qmatrix[qmatrix>0]),
+                     lp     = 1:ntransitions)
+@ 
+
+Check the consistency of the qcoef, rcoef, and pcoef data frames. With respect
+to variable names and the identifier colums.  
+For qcoef the identifier colums state1 and state2 have to match the states
+found in qmatrix, either by position or name.
+It should not refer to any transitions that cannot occur.
+ 
+<<hmm-coef>>=
+qtest <- function(x, allowed, e1, e2, label="qcoef") {
+     if (is.numeric(x)) {
+        if (any(x != floor(x)) || any(x < 1))
+            stop(paste(label, "numeric", e2, "must be integers greater than 0"))
+        if (any(x > length(allowed))) 
+            stop(label, ": numeric", e1, "that is > number of", e2)
+        x
+    }
+    else {
+        temp <- match(x, allowed, nomatch=0)
+        if (any(temp==0)) stop(paste(label, ": unrecognized", e1, "name"))
+        temp
+    }
+} 
+
+has.qcoef <- !(missing(qcoef) || is.null(qcoef))
+has.rcoef <- !(missing(rcoef) || is.null(rcoef))
+has.pcoef <- !(missing(pcoef) || is.null(pcoef))
+
+if (has.qcoef) {
+    if (!is.data.frame(qcoef)) stop("qcoef must be a data frame")
+    index <- match(c("state1", "state2", "term", "coef"),
+                   names(qcoef), nomatch=0)
+    if (any(index==0)) 
+        stop("qcoef must contain variables named state1, state2, term, and coef")
+    qcoef$state1 <- qtest(qcoef$state1, statenames, "state", "states")
+    qcoef$state2 <- qtest(qcoef$state2, statenames, "state", "states")
+    itemp <- as.matrix(qcoef[, index[1:2]])
+    if (any(qmatrix[itemp] ==0)) 
+        stop("qcoef contains an invalid state1 to state2 transition")
+    qmatrix[qmatrix >0] <- 1:ntransitions  # the transition number
+    qcoef$lp <- qmatrix[itemp]
+    if (is.null(qcoef$init)) qcoef$init <- 0.0
+    if (is.character(qcoef$term)) qcoef2$term <- "(Intercept)"
+    qcoef <- rbind(qcoef, qcoef2)  # initial values from the qmatrix
+    qcoef <- qcoef[!duplicated(qcoef[,1:3]),]
+}
+else qcoef <- qcoef2
+@ 
+
+The rcoef frame also has two possible identifiers.  The first is the
+response number, which can be omitted if there is only one response, the
+second identifies the linear predictor for the term.   
+The data frame for initial states has only linear predictor as an identifier.
+ 
+<<hmm-coef>>=
+if (has.rcoef) {
+    if (!is.data.frame(rcoef)) stop("rcoef must be a data frame")
+    index <- match(c("response", "lp", "term", "coef"), 
+                   names(rcoef), nomatch=0)
+    if (ny > 1 && any(index==0) )
+        stop("rcoef must contain variables named response, lp, term, and coef")
+    else if (ny ==1 && any(index[-1] ==0))
+        stop("rcoef must contain variables named lp, term, and coef")
+    if (!is.null(rcoef$response) && !all(rcoef$response %in% 1:ny))
+        stop("rcoef$response is out of range")
+    if (any(is.na(rcoef$lp))) stop("missing lp value in rcoef")
+    if (ny >1) {  # renumber the linear predictors so as to be unique
+        maxlp <- max(rcoef$lp)
+        newlp <- rcoef$lp + rcoef$response * maxlp
+        newlp <- match(newlp, sort(unique(newlp)))
+        rcoef$lp <- newlp
+        b2map <- vector("list", ny)
+        for (i in 1:ny) b2map[[i]] <- unique(newlp[rcoef$response==i])
+    }
+    else {
+        rcoef$lp <- match(rcoef$lp, sort(unique(rcoef$lp)))
+        b2map <- list(sort(unique(rcoef$lp)))
+    }
+}
+if (has.pcoef) {
+    if (!is.data.frame(pcoef)) stop("pcoef must be a data frame")
+    index <- match(c("lp", "term", "coef"), 
+                   names(pcoef), nomatch=0)
+    if (any(index==0)) 
+        stop("pcoef must contain variables named lp, term, and coef")
+    if (any(is.na(pcoef$lp))) stop("missing lp value in pcoef")
+}
+@ 
+
+Now create the maps.  There is a single linear predictor for each
+transition, which will normally become first \code{ntransition}
+columns of both cmap and beta.
+The next colums of beta will be for the response function(s)
+and the last any linear predictors for the initial state.  
+Each row qcoef, rcoef, or pcoef specifies a \emph{term} in the model,
+a sharing index, and optionally an initial value other than 0.
+The term number refers to terms in the formula.
+The \code{coef} variable is simply a unique identifier; and identifies
+when two uses of the same term have the same coefficient.
+A coef value of 0 means that the coefficient
+is fixed at its initial value.
+For a term like \code{ns(age,3)} there are multiple coefficients;
+when qcoef has a line saying that said term applies to a particular
+linear predictor we need to map that to all the coefficients for the term.
+The mapping from terms to colums is found in the \code{assign}
+attribute of $X$, which uses 0 for the intercept.
+<<hmm-coef>>=
+termvars <- table(xassign)  #max coefficients for a term
+testterm <- function(tcoef, tlab) {
+    if (is.numeric(tcoef$term)) {
+        if (any(tcoef$term != floor(tcoef$term)) || any(tcoef$term < 0))
+            stop(paste(tlab, ": numeric terms must be integers greater >= 0"))
+        if (any(tcoef$term > length(termnames)-1)) 
+            stop(tlab, ": numeric term that is > number of terms in the model")
+    }
+    else {
+        temp <- match(tcoef$term, termnames, nomatch=0)
+        if (any(temp==0)) stop(tlab, ": unrecognized term name")
+        tcoef$term <- temp-1
+    }
+        
+    if (!is.numeric(tcoef$coef) || any(tcoef$coef != floor(tcoef$coef)))
+        stop(tlab, ": param variable must contain non-negative integers")
+    
+    # Any intial value columns.  There may be none
+    init <- matrix(0, nrow=nrow(tcoef), ncol=max(termvars))
+    temp <- as.matrix(tcoef[,grepl("init", names(tcoef))])
+    if (ncol(temp) > 0) { #found something
+        init[,1:ncol(temp)] <- temp
+        init <- ifelse(is.na(init), 0, init) # any not set become 0
+    }
+	
+    tcoef$lp  <- match(tcoef$lp, sort(unique(tcoef$lp)))
+    
+    beta <- matrix(0., nrow=ncol(X), ncol=max(tcoef$lp))
+    cmap <- matrix(0L, nrow(beta), ncol(beta))
+    ucoef <- unique(tcoef$coef)
+    ucoef <- sort(ucoef[ucoef>0])  # user may not have used 1, 2, 3,..
+    # It is not legal to have two rows with the same coef param that
+    #  point to different terms.
+    # cpar = parameter numbers for each coef param
+    cpar <- vector("list", length(ucoef))
+    k <- 0
+    for (i in seq_along(ucoef)) {
+        j <- which(tcoef$coef == ucoef[i])
+        if (any(tcoef$term[j] != tcoef$term[j[1]]))
+            stop(tlab, ": the same coefficient param points to two terms")
+        indx <- 1:termvars[tcoef$term[j[1]] +1] +k
+        cpar[[i]] <- indx 
+        k <- max(indx)
+    }
+    for (i in 1:nrow(tcoef)) {
+        j <- (xassign == tcoef$term[i]) #columns of X for this term
+        k <- 1:sum(j)  #how many coefs for this term
+        if (any(init[i, k] !=0)) beta[j, tcoef$lp[i]] <- init[i, k]
+        if (tcoef$coef[i] >0) # fixed coefs don't appear in cmap
+	   cmap[j, tcoef$lp[i]] <- cpar[[match(tcoef$coef[i], ucoef)]]
+    }
+    list(beta=beta, cmap=cmap)
+}
+     
+temp <- testterm(qcoef, "qcoef")
+beta <- temp$beta
+cmap <- temp$cmap
+bcount <- c(q = ncol(cmap), m=0, p=0) # number of columns of beta and cmap
+pcount <- c(length(unique(cmap[cmap>0])), 0L, 0L) #number of parameters
+if (has.rcoef) {
+    temp <- testterm(rcoef, "rcoef")
+    bcount[2] <- ncol(temp$cmap)
+    pcount[2] <- length(unique(temp$cmap[temp$cmap>0]))
+    beta <- cbind(beta, temp$beta)
+    cmap <- cbind(cmap, temp$cmap + ifelse(temp$cmap>0, max(cmap), 0))
+} 
+if (has.pcoef) {
+    temp <- testterm(pcoef, "rcoef")
+    bcount[3] <- ncol(temp$cmap)
+    pcount[3] <- length(unique(temp$cmap[temp$cmap>0]))
+    beta <- cbind(beta, temp$beta)
+    cmap <- cbind(cmap, temp$cmap + ifelse(temp$cmap>0, max(cmap), 0))
+}
+b1 <- 1:bcount[1]
+b2 <- seq(bcount[1]+1, length=bcount[2])  #might be nothing
+b3 <- seq(bcount[1] + bcount[2] +1, length=bcount[3])
+nparm <- max(cmap)
+@ 
+
+We now have the full beta matrix; the \code{bcount} vector
+shows how many columns of the matrix are used by the states, mappings,
+and initial state. 
+If the data was scaled, then rescale beta as well.  (If it wasn't
+scaled the scaling vector will be 1).
+Do this before processing an icoef argument.
+If there is in icoef argument, use it to set the coefficients.  This
+arg makes it easier to restart an Markov chain at the old value in order
+to get more iterations.
+If \code{icoef} is a matrix we assume that it is a match to the beta,
+otherwise to coef.  In the beta case we match by row and column name
+to further assure things are ok.
+<<hmm-setup-other>>=
+beta <- beta * scale$scale
+if (!missing(icoef)) {
+    if (is.matrix(icoef)) {
+        bcol <- paste0(row(qmatrix)[qmatrix!=0], ":",
+                       col(qmatrix)[qmatrix!=0])
+        if (bcount[2]>0) bcol <- c(bcol, paste0("R", 1:bcount[2]))
+        if (bcount[3]>0) bcol <- c(bcol, paste0("p", 1:bcount[3]))
+        
+        dname <- dimnames(icoef)
+        cindex <- match(dname[[2]], bcol)
+        rindex <- match(dname[[2]], dimnames(X)[[2]])
+        if (any(is.na(cindex)) || any(is.na(rindex)))
+            stop("row and column names for icoef don't match the model")
+        beta[rindex, cindex] <- icoef
+    }
+    else {
+        if (length(icoef) != nparm) 
+            stop("icoef is the wrong length")
+        beta[cmap>0] <- icoef[cmap]
+    }
+}    
+
+param <- double(nparm)
+temp <- (cmap>0)
+param[cmap[temp]] <- beta[temp]   #load it with the initial parameters
+rindex <- which(qmatrix > 0)
+@ 
+
+The bcount, b1, etc variables give indices into the cmap and beta arrays.
+For derivatives we also need a count of parameters, which will normally be
+larger than the number of linear predictors.
+<<hmm-setup-other>>=
+tempfun <- function(x) length(unique(x[x>0]))
+parmcount <- c(tempfun(cmap[,b1]), tempfun(cmap[,b2]), tempfun(cmap[,b3]))
+@ 
+
+Check that all of the response functions can be called.  Are there the
+right number of them and do they have the right parameters?
+Update b2map to be the linear predictor number within the full beta matrix
+rather than just the response functions.
+<<hmm-setup-other>>=
+if (ny ==1 && !is.list(rfun)) rfun <- list(rfun)  # make it a list of length 1
+if (ny != length(rfun))
+    stop("must have one modeling function per respsonse")
+
+if (bcount[2]) b2map <- lapply(b2map, function(x) x+ bcount[1])
+else b2map <- vector("list", ny)
+
+doresponse <- (otype==1 | otype==3)  # the rows for a response function
+if (!any(doresponse))
+    stop("all observations are exact or censored")
+# Do a dummy call to the response function(s), and make sure they
+#  return an object of the right shape.
+eta <- X%*% beta
+for (i in 1:ny) {
+    keep <- (doresponse & !is.na(yobs[,i]))
+    fit <- try(rfun[[i]](yobs[keep,i], nstate, 
+                         eta[keep,b2map[[i]], drop=FALSE], gradient=FALSE))
+    if (is.character(fit)) 
+        stop("call failed for response function ", i)
+    if (length(i) ==1) fit <- as.matrix(fit)
+    if (!is.matrix(fit) || nrow(fit)!= nstate || ncol(fit)!= sum(keep))
+        stop("response function must return a matrix with nstate rows and one column per response")
+}
+@ 
+
+If there is a penalty matrix, check that it is the right size and is legal.
+(It should have a cholesky decomposition).
+<<hmm-setup-other>>=
+if (missing(penalty)) pmat <- NULL  #this will be used as a flag
+else {
+    pmat <- penalty
+    if (!is.matrix(pmat) || !is.numeric(pmat) || nrow(pmat) != ncol(pmat))
+        stop("pmat must be a square numeric matrix")
+    if (nrow(pmat) != nparm) 
+        stop("nrow(pmat) != number of parameters")
+    if (!all.equal(pmat, t(pmat))) stop("penalty matrix must be symmetric")
+    test <- svd(pmat, nv=0)
+    if (any(test$d < 0) || sign(diag(test$u)) != sign(diag(test$v)))
+        stop("penalty matrix must be non-negative definite")
+    }
+@ 
+
+If there is a constraint matrix, ensure that it has the right form.
+<<hmm-setup-other>>=
+if (missing(constraint)) constraint <- NULL  #this will be used as a flag
+else {
+    if (!is.matrix(constraint) || !is.numeric(constraint) || 
+        nparm != ncol(constraint))
+        stop("constraint must be a numeric matrix with one column per parameter")
+    }
+@ 
