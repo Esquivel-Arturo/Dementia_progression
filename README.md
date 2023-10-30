@@ -5,7 +5,7 @@ The code was used to conduct simulation studies regarding the continuous-time hi
 
 Te repository is organized through three folders:
 
-- \textit{New$\_$work} contains all of our original work made for this project. Some of the scripts contain code adapted from the work by Williams et al.. When that is the case, the part of the script that was adapted is indicated. 
+- * * Newwork * * contains all of our original work made for this project. Some of the scripts contain code adapted from the work by Williams et al.. When that is the case, the part of the script that was adapted is indicated. 
 
 - \textit{Supplemental} contains results like those shown in Appendix 2 of the report for every parameter in the dementia progression model. 
 
